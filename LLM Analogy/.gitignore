@@ -1,0 +1,7 @@
+.env
+*.log
+*.json
+*.csv
+*.jsonl
+*.jsonl.gz
+*.jsonl.gz.part
