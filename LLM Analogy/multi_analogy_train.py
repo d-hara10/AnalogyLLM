@@ -1,11 +1,10 @@
-import openai
 import torch
 import os, json
 from pathlib import Path
 import datetime
-from dotenv import load_dotenv
 import logging
 import sys
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # === SETUP LOGGING ===
 logging.basicConfig(
@@ -19,19 +18,51 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-PROJECT_DIR = "/Users/derek/Desktop/CLUBS/LLM Analogy"
+PROJECT_DIR = "/Users/derek/Desktop/CLUBS/AnalogyLLM/LLM Analogy"
 ROLLOUTS_DIR = f"{PROJECT_DIR}/rollouts"
+MODEL_DIR = f"{PROJECT_DIR}/model"
 NUM_ANALOGIES = 3  # Number of analogies to generate at once
 
-# Load environment variables
-load_dotenv()
-api_key = os.getenv('OPENAI_API_KEY')
-if not api_key:
-    logger.error("No OpenAI API key found in .env file")
-    raise ValueError("OpenAI API key not found in .env file")
+# Create directories if they don't exist
+os.makedirs(ROLLOUTS_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-logger.info("API Key found (first 4 chars): %s...", api_key[:4])
-openai.api_key = api_key
+# === LOAD MODEL ===
+model_name = "mistralai/Mistral-7B-v0.1"
+
+# Check if we have a valid model in the directory
+has_valid_model = False
+if os.path.exists(MODEL_DIR):
+    try:
+        # Try to load the model from the directory
+        model = AutoModelForCausalLM.from_pretrained(MODEL_DIR)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+        has_valid_model = True
+        print("Loaded existing model from", MODEL_DIR)
+    except Exception as e:
+        print(f"Could not load existing model: {e}")
+        print("Downloading fresh model from HuggingFace...")
+
+if not has_valid_model:
+    # Load fresh model from HuggingFace
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,  # Use half precision to save memory
+        device_map="auto"  # Automatically handle device placement
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        padding_side="left",
+        pad_token="<|pad|>",  # Set a specific pad token
+        model_max_length=2048  # Set maximum length
+    )
+    # Save the fresh model
+    model.save_pretrained(MODEL_DIR)
+    tokenizer.save_pretrained(MODEL_DIR)
+    print("Saved fresh model to", MODEL_DIR)
+
+# Configure model for padding
+model.config.pad_token_id = tokenizer.pad_token_id
 
 # System message to guide the model
 SYSTEM_MESSAGE = """You are an expert at creating mathematical analogies across different domains. 
@@ -55,80 +86,65 @@ def generate_analogies(prompt, num_analogies=NUM_ANALOGIES):
         {
             "temperature": 0.9,  # More creative
             "top_p": 0.9,
-            "presence_penalty": 0.6,
-            "frequency_penalty": 0.6
+            "repetition_penalty": 1.2,
+            "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id
         },
         {
             "temperature": 0.7,  # More focused
             "top_p": 0.8,
-            "presence_penalty": 0.8,
-            "frequency_penalty": 0.8
+            "repetition_penalty": 1.3,
+            "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id
         },
         {
             "temperature": 1.1,  # Most creative
             "top_p": 0.95,
-            "presence_penalty": 1.0,
-            "frequency_penalty": 1.0
+            "repetition_penalty": 1.1,
+            "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id
         }
     ]
     
     for i in range(num_analogies):
         try:
-            logger.info(f"Attempting to generate analogy {i+1} with GPT-4")
+            logger.info(f"Attempting to generate analogy {i+1}")
             logger.debug(f"Using parameters: {generation_params[i]}")
             
-            response = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": SYSTEM_MESSAGE},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=300,
+            # Prepare the input with system message
+            full_prompt = f"{SYSTEM_MESSAGE}\n\nUser: {prompt}\nAssistant:"
+            inputs = tokenizer(
+                full_prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048,
+                return_attention_mask=True
+            ).to(model.device)
+            
+            # Generate response
+            outputs = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_length=300,
+                num_return_sequences=1,
                 **generation_params[i]
             )
-            analogy = response.choices[0].message.content.strip()
+            
+            # Decode and clean the response
+            analogy = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            analogy = analogy.replace(full_prompt, "").strip()
+            
             logger.info(f"Successfully generated analogy {i+1}")
             logger.debug(f"Generated analogy: {analogy[:100]}...")  # Log first 100 chars
             analogies.append(analogy)
             
-        except openai.AuthenticationError as e:
-            logger.error(f"Authentication Error: {str(e)}")
-            logger.error("Please check your API key in the .env file")
-            analogies.append("Authentication Error: Please check your API key")
-            
-        except openai.RateLimitError as e:
-            logger.error(f"Rate Limit Error: {str(e)}")
-            logger.error("You've hit the API rate limit. Please wait a moment and try again.")
-            analogies.append("Rate Limit Error: Please wait and try again")
-            
-        except openai.APIError as e:
-            logger.error(f"API Error: {str(e)}")
-            logger.error("There was an issue with the OpenAI API")
-            analogies.append("API Error: Please try again later")
-            
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            logger.error("Attempting fallback to GPT-3.5-turbo")
-            
-            try:
-                logger.info("Attempting to generate with GPT-3.5-turbo")
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_MESSAGE},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=300,
-                    **generation_params[i]
-                )
-                analogy = response.choices[0].message.content.strip()
-                logger.info("Successfully generated analogy with GPT-3.5-turbo")
-                logger.debug(f"Generated analogy: {analogy[:100]}...")
-                analogies.append(analogy)
-                
-            except Exception as fallback_error:
-                logger.error(f"Fallback error: {str(fallback_error)}")
-                analogies.append(f"Error generating analogy: {str(fallback_error)}")
+            logger.error(f"Error generating analogy: {str(e)}")
+            analogies.append(f"Error generating analogy: {str(e)}")
     
     return analogies
 
@@ -175,7 +191,7 @@ def save_rollout(prompt, selected_analogy, one_hot_reward):
         print(f"Error saving rollout: {str(e)}")
 
 def main():
-    logger.info("Starting analogy generation program")
+    logger.info("Starting analogy generation program with Mistral-7B")
     
     while True:
         prompt = input("\nEnter a prompt (or 'quit' to exit): ")
